@@ -46,6 +46,11 @@ abstract class DiffusionRepositoryManagementPanel
     return array();
   }
 
+  public function shouldEnableForRepository(
+    PhabricatorRepository $repository) {
+    return true;
+  }
+
   final protected function newActions() {
     $actions = $this->buildManagementPanelActions();
     if (!$actions) {
@@ -139,5 +144,8 @@ abstract class DiffusionRepositoryManagementPanel
     return "/diffusion/edit/{$id}/page/{$page}/";
   }
 
+  public function getPanelNavigationURI() {
+    return $this->getPanelURI();
+  }
 
 }

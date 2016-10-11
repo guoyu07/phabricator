@@ -193,10 +193,12 @@ final class PhabricatorApplicationSearchController
     }
 
     $header = id(new PHUIHeaderView())
-      ->setHeader($title);
+      ->setHeader($title)
+      ->setProfileHeader(true);
 
     $box = id(new PHUIObjectBoxView())
-      ->setHeader($header);
+      ->setHeader($header)
+      ->addClass('application-search-results');
 
     if ($run_query || $named_query) {
       $box->setShowHide(
@@ -210,9 +212,11 @@ final class PhabricatorApplicationSearchController
     }
 
     $body[] = $box;
-
+    $more_crumbs = null;
 
     if ($run_query) {
+      $exec_errors = array();
+
       $box->setAnchor(
         id(new PhabricatorAnchorView())
           ->setAnchorName('R'));
@@ -248,12 +252,6 @@ final class PhabricatorApplicationSearchController
                 get_class($engine)));
           }
 
-          if ($list->getActions()) {
-            foreach ($list->getActions() as $action) {
-              $header->addActionLink($action);
-            }
-          }
-
           if ($list->getObjectList()) {
             $box->setObjectList($list->getObjectList());
           }
@@ -266,24 +264,50 @@ final class PhabricatorApplicationSearchController
           if ($list->getContent()) {
             $box->appendChild($list->getContent());
           }
-          if ($list->getCollapsed()) {
-            $box->setCollapsed(true);
+
+          $result_header = $list->getHeader();
+          if ($result_header) {
+            $box->setHeader($result_header);
+            $header = $result_header;
           }
+
+          if ($list->getActions()) {
+            foreach ($list->getActions() as $action) {
+              $header->addActionLink($action);
+            }
+          }
+
+          $use_actions = $engine->newUseResultsActions($saved_query);
+          if ($use_actions) {
+            $use_dropdown = $this->newUseResultsDropdown(
+              $saved_query,
+              $use_actions);
+            $header->addActionLink($use_dropdown);
+          }
+
+          $more_crumbs = $list->getCrumbs();
 
           if ($pager->willShowPagingControls()) {
             $pager_box = id(new PHUIBoxView())
-              ->addPadding(PHUI::PADDING_MEDIUM)
-              ->addMargin(PHUI::MARGIN_LARGE)
-              ->setBorder(true)
+              ->setColor(PHUIBoxView::GREY)
+              ->addClass('application-search-pager')
               ->appendChild($pager);
             $body[] = $pager_box;
           }
         }
       } catch (PhabricatorTypeaheadInvalidTokenException $ex) {
-        $errors[] = pht(
+        $exec_errors[] = pht(
           'This query specifies an invalid parameter. Review the '.
           'query parameters and correct errors.');
       }
+
+      // The engine may have encountered additional errors during rendering;
+      // merge them in and show everything.
+      foreach ($engine->getErrors() as $error) {
+        $exec_errors[] = $error;
+      }
+
+      $errors = $exec_errors;
     }
 
     if ($errors) {
@@ -292,7 +316,21 @@ final class PhabricatorApplicationSearchController
 
     $crumbs = $parent
       ->buildApplicationCrumbs()
-      ->addTextCrumb($title);
+      ->setBorder(true);
+
+    if ($more_crumbs) {
+      $query_uri = $engine->getQueryResultsPageURI($saved_query->getQueryKey());
+      $crumbs->addTextCrumb($title, $query_uri);
+
+      foreach ($more_crumbs as $crumb) {
+        $crumbs->addCrumb($crumb);
+      }
+    } else {
+      $crumbs->addTextCrumb($title);
+    }
+
+    $nav->addClass('application-search-view');
+    require_celerity_resource('application-search-view-css');
 
     return $this->newPage()
       ->setApplicationMenu($this->buildApplicationMenu())
@@ -376,13 +414,22 @@ final class PhabricatorApplicationSearchController
 
     $crumbs = $parent
       ->buildApplicationCrumbs()
-      ->addTextCrumb(pht('Saved Queries'), $engine->getQueryManagementURI());
+      ->addTextCrumb(pht('Saved Queries'), $engine->getQueryManagementURI())
+      ->setBorder(true);
 
     $nav->selectFilter('query/edit');
 
+    $header = id(new PHUIHeaderView())
+      ->setHeader(pht('Saved Queries'))
+      ->setProfileHeader(true);
+
     $box = id(new PHUIObjectBoxView())
-      ->setHeaderText(pht('Saved Queries'))
-      ->setObjectList($list);
+      ->setHeader($header)
+      ->setObjectList($list)
+      ->addClass('application-search-results');
+
+    $nav->addClass('application-search-view');
+    require_celerity_resource('application-search-view-css');
 
     return $this->newPage()
       ->setApplicationMenu($this->buildApplicationMenu())
@@ -458,5 +505,24 @@ final class PhabricatorApplicationSearchController
     return $nux_view;
   }
 
+  private function newUseResultsDropdown(
+    PhabricatorSavedQuery $query,
+    array $dropdown_items) {
+
+    $viewer = $this->getViewer();
+
+    $action_list = id(new PhabricatorActionListView())
+      ->setViewer($viewer);
+    foreach ($dropdown_items as $dropdown_item) {
+      $action_list->addAction($dropdown_item);
+    }
+
+    return id(new PHUIButtonView())
+      ->setTag('a')
+      ->setHref('#')
+      ->setText(pht('Use Results...'))
+      ->setIcon('fa-road')
+      ->setDropdownMenu($action_list);
+  }
 
 }

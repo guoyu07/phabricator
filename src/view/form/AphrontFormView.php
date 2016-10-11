@@ -9,11 +9,11 @@ final class AphrontFormView extends AphrontView {
   private $encType;
   private $workflow;
   private $id;
-  private $shaded = false;
   private $sigils = array();
   private $metadata;
   private $controls = array();
   private $fullWidth = false;
+  private $classes = array();
 
   public function setMetadata($metadata) {
     $this->metadata = $metadata;
@@ -44,11 +44,6 @@ final class AphrontFormView extends AphrontView {
     return $this;
   }
 
-  public function setShaded($shaded) {
-    $this->shaded = $shaded;
-    return $this;
-  }
-
   public function addHiddenInput($key, $value) {
     $this->data[$key] = $value;
     return $this;
@@ -61,6 +56,11 @@ final class AphrontFormView extends AphrontView {
 
   public function addSigil($sigil) {
     $this->sigils[] = $sigil;
+    return $this;
+  }
+
+  public function addClass($class) {
+    $this->classes[] = $class;
     return $this;
   }
 
@@ -84,9 +84,20 @@ final class AphrontFormView extends AphrontView {
   }
 
   public function appendRemarkupInstructions($remarkup) {
-    return $this->appendInstructions(
-      new PHUIRemarkupView($this->getViewer(), $remarkup));
+    $view = $this->newInstructionsRemarkupView($remarkup);
+    return $this->appendInstructions($view);
+  }
 
+  public function newInstructionsRemarkupView($remarkup) {
+    $viewer = $this->getViewer();
+    $view = new PHUIRemarkupView($viewer, $remarkup);
+
+    $view->setRemarkupOptions(
+      array(
+        PHUIRemarkupView::OPTION_PRESERVE_LINEBREAKS => false,
+      ));
+
+    return $view;
   }
 
   public function buildLayoutView() {
@@ -138,7 +149,7 @@ final class AphrontFormView extends AphrontView {
     return phabricator_form(
       $this->getViewer(),
       array(
-        'class'   => $this->shaded ? 'phui-form-shaded' : null,
+        'class'   => implode(' ', $this->classes),
         'action'  => $this->action,
         'method'  => $this->method,
         'enctype' => $this->encType,

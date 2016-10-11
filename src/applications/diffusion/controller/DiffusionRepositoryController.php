@@ -669,20 +669,23 @@ final class DiffusionRepositoryController extends DiffusionController {
     PhabricatorRepository $repository,
     PhabricatorRepositoryURI $uri) {
 
-    require_celerity_resource('diffusion-icons-css');
+    if ($repository->isSVN()) {
+      $display = csprintf(
+        'svn checkout %R %R',
+        (string)$uri->getDisplayURI(),
+        $repository->getCloneName());
+    } else {
+      $display = csprintf('%R', (string)$uri->getDisplayURI());
+    }
 
-    $display = (string)csprintf('%R', (string)$uri->getDisplayURI());
+    $display = (string)$display;
+    $viewer = $this->getViewer();
 
-    $input = javelin_tag(
-      'input',
-      array(
-        'type' => 'text',
-        'value' => $display,
-        'class' => 'diffusion-clone-uri',
-        'readonly' => 'true',
-      ));
-
-    return $input;
+    return id(new DiffusionCloneURIView())
+      ->setViewer($viewer)
+      ->setRepository($repository)
+      ->setRepositoryURI($uri)
+      ->setDisplayURI($display);
   }
 
 }

@@ -7,6 +7,7 @@ final class DifferentialTransactionEditor
   private $isCloseByCommit;
   private $repositoryPHIDOverride = false;
   private $didExpandInlineState = false;
+  private $affectedPaths;
 
   public function getEditorApplicationClass() {
     return 'PhabricatorDifferentialApplication';
@@ -181,6 +182,7 @@ final class DifferentialTransactionEditor
     $status_revision = ArcanistDifferentialRevisionStatus::NEEDS_REVISION;
     $status_plan = ArcanistDifferentialRevisionStatus::CHANGES_PLANNED;
     $status_abandoned = ArcanistDifferentialRevisionStatus::ABANDONED;
+    $status_accepted = ArcanistDifferentialRevisionStatus::ACCEPTED;
 
     switch ($xaction->getTransactionType()) {
       case DifferentialTransaction::TYPE_INLINE:
@@ -232,7 +234,12 @@ final class DifferentialTransactionEditor
             $object->setStatus($status_review);
             return;
           case DifferentialAction::ACTION_CLOSE:
+            $old_status = $object->getStatus();
             $object->setStatus(ArcanistDifferentialRevisionStatus::CLOSED);
+            $was_accepted = ($old_status == $status_accepted);
+            $object->setProperty(
+              DifferentialRevision::PROPERTY_CLOSED_FROM_ACCEPTED,
+              $was_accepted);
             return;
           case DifferentialAction::ACTION_CLAIM:
             $object->setAuthorPHID($this->getActingAsPHID());
@@ -1200,7 +1207,13 @@ final class DifferentialTransactionEditor
     $body = new PhabricatorMetaMTAMailBody();
     $body->setViewer($this->requireActor());
 
-    $this->addHeadersAndCommentsToMailBody($body, $xactions);
+    $revision_uri = PhabricatorEnv::getProductionURI('/D'.$object->getID());
+
+    $this->addHeadersAndCommentsToMailBody(
+      $body,
+      $xactions,
+      pht('View Revision'),
+      $revision_uri);
 
     $type_inline = DifferentialTransaction::TYPE_INLINE;
 
@@ -1226,7 +1239,7 @@ final class DifferentialTransactionEditor
 
     $body->addLinkSection(
       pht('REVISION DETAIL'),
-      PhabricatorEnv::getProductionURI('/D'.$object->getID()));
+      $revision_uri);
 
     $update_xaction = null;
     foreach ($xactions as $xaction) {
@@ -1251,21 +1264,18 @@ final class DifferentialTransactionEditor
       $config_attach = PhabricatorEnv::getEnvConfig($config_key_attach);
 
       if ($config_inline || $config_attach) {
-        $patch_section = $this->renderPatchForMail($diff);
-        $lines = count(phutil_split_lines($patch_section->getPlaintext()));
+        $patch = $this->buildPatchForMail($diff);
+        $lines = substr_count($patch, "\n");
 
         if ($config_inline && ($lines <= $config_inline)) {
-          $body->addTextSection(
-            pht('CHANGE DETAILS'),
-            $patch_section);
+          $this->appendChangeDetailsForMail($object, $diff, $patch, $body);
         }
 
         if ($config_attach) {
           $name = pht('D%s.%s.patch', $object->getID(), $diff->getID());
           $mime_type = 'text/x-patch; charset=utf-8';
           $body->addAttachment(
-            new PhabricatorMetaMTAAttachment(
-              $patch_section->getPlaintext(), $name, $mime_type));
+            new PhabricatorMetaMTAAttachment($patch, $name, $mime_type));
         }
       }
     }
@@ -1299,10 +1309,10 @@ final class DifferentialTransactionEditor
   protected function expandCustomRemarkupBlockTransactions(
     PhabricatorLiskDAO $object,
     array $xactions,
-    $blocks,
+    array $changes,
     PhutilMarkupEngine $engine) {
 
-    $flat_blocks = array_mergev($blocks);
+    $flat_blocks = mpull($changes, 'getNewValue');
     $huge_block = implode("\n\n", $flat_blocks);
 
     $task_map = array();
@@ -1387,7 +1397,38 @@ final class DifferentialTransactionEditor
     $section_text = "\n".$section->getPlaintext();
 
     $style = array(
-      'margin: 12px 0;',
+      'margin: 6px 0 12px 0;',
+    );
+
+    $section_html = phutil_tag(
+      'div',
+      array(
+        'style' => implode(' ', $style),
+      ),
+      $section->getHTML());
+
+    $body->addPlaintextSection($header, $section_text, false);
+    $body->addHTMLSection($header, $section_html);
+  }
+
+  private function appendChangeDetailsForMail(
+    PhabricatorLiskDAO $object,
+    DifferentialDiff $diff,
+    $patch,
+    PhabricatorMetaMTAMailBody $body) {
+
+    $section = id(new DifferentialChangeDetailMailView())
+      ->setViewer($this->getActor())
+      ->setDiff($diff)
+      ->setPatch($patch)
+      ->buildMailSection();
+
+    $header = pht('CHANGE DETAILS');
+
+    $section_text = "\n".$section->getPlaintext();
+
+    $style = array(
+      'margin: 6px 0 12px 0;',
     );
 
     $section_html = phutil_tag(
@@ -1451,6 +1492,174 @@ final class DifferentialTransactionEditor
     }
 
     return parent::shouldApplyHeraldRules($object, $xactions);
+  }
+
+  protected function didApplyHeraldRules(
+    PhabricatorLiskDAO $object,
+    HeraldAdapter $adapter,
+    HeraldTranscript $transcript) {
+
+    $repository = $object->getRepository();
+    if (!$repository) {
+      return array();
+    }
+
+    if (!$this->affectedPaths) {
+      return array();
+    }
+
+    $packages = PhabricatorOwnersPackage::loadAffectedPackages(
+      $repository,
+      $this->affectedPaths);
+    if (!$packages) {
+      return array();
+    }
+
+    // Remove packages that the revision author is an owner of. If you own
+    // code, you don't need another owner to review it.
+    $authority = id(new PhabricatorOwnersPackageQuery())
+      ->setViewer(PhabricatorUser::getOmnipotentUser())
+      ->withPHIDs(mpull($packages, 'getPHID'))
+      ->withAuthorityPHIDs(array($object->getAuthorPHID()))
+      ->execute();
+    $authority = mpull($authority, null, 'getPHID');
+
+    foreach ($packages as $key => $package) {
+      $package_phid = $package->getPHID();
+      if (isset($authority[$package_phid])) {
+        unset($packages[$key]);
+        continue;
+      }
+    }
+
+    if (!$packages) {
+      return array();
+    }
+
+    $auto_subscribe = array();
+    $auto_review = array();
+    $auto_block = array();
+
+    foreach ($packages as $package) {
+      switch ($package->getAutoReview()) {
+        case PhabricatorOwnersPackage::AUTOREVIEW_SUBSCRIBE:
+          $auto_subscribe[] = $package;
+          break;
+        case PhabricatorOwnersPackage::AUTOREVIEW_REVIEW:
+          $auto_review[] = $package;
+          break;
+        case PhabricatorOwnersPackage::AUTOREVIEW_BLOCK:
+          $auto_block[] = $package;
+          break;
+        case PhabricatorOwnersPackage::AUTOREVIEW_NONE:
+        default:
+          break;
+      }
+    }
+
+    $owners_phid = id(new PhabricatorOwnersApplication())
+      ->getPHID();
+
+    $xactions = array();
+    if ($auto_subscribe) {
+      $xactions[] = $object->getApplicationTransactionTemplate()
+        ->setAuthorPHID($owners_phid)
+        ->setTransactionType(PhabricatorTransactions::TYPE_SUBSCRIBERS)
+        ->setNewValue(
+          array(
+            '+' => mpull($auto_subscribe, 'getPHID'),
+          ));
+    }
+
+    $specs = array(
+      array($auto_review, false),
+      array($auto_block, true),
+    );
+
+    foreach ($specs as $spec) {
+      list($reviewers, $blocking) = $spec;
+      if (!$reviewers) {
+        continue;
+      }
+
+      $phids = mpull($reviewers, 'getPHID');
+      $xaction = $this->newAutoReviewTransaction($object, $phids, $blocking);
+      if ($xaction) {
+        $xactions[] = $xaction;
+      }
+    }
+
+    return $xactions;
+  }
+
+  private function newAutoReviewTransaction(
+    PhabricatorLiskDAO $object,
+    array $phids,
+    $is_blocking) {
+
+    // TODO: This is substantially similar to DifferentialReviewersHeraldAction
+    // and both are needlessly complex. This logic should live in the normal
+    // transaction application pipeline. See T10967.
+
+    $reviewers = $object->getReviewerStatus();
+    $reviewers = mpull($reviewers, null, 'getReviewerPHID');
+
+    if ($is_blocking) {
+      $new_status = DifferentialReviewerStatus::STATUS_BLOCKING;
+    } else {
+      $new_status = DifferentialReviewerStatus::STATUS_ADDED;
+    }
+
+    $new_strength = DifferentialReviewerStatus::getStatusStrength(
+      $new_status);
+
+    $current = array();
+    foreach ($phids as $phid) {
+      if (!isset($reviewers[$phid])) {
+        continue;
+      }
+
+      // If we're applying a stronger status (usually, upgrading a reviewer
+      // into a blocking reviewer), skip this check so we apply the change.
+      $old_strength = DifferentialReviewerStatus::getStatusStrength(
+        $reviewers[$phid]->getStatus());
+      if ($old_strength <= $new_strength) {
+        continue;
+      }
+
+      $current[] = $phid;
+    }
+
+    $phids = array_diff($phids, $current);
+
+    if (!$phids) {
+      return null;
+    }
+
+    $phids = array_fuse($phids);
+
+    $value = array();
+    foreach ($phids as $phid) {
+      $value[$phid] = array(
+        'data' => array(
+          'status' => $new_status,
+        ),
+      );
+    }
+
+    $edgetype_reviewer = DifferentialRevisionHasReviewerEdgeType::EDGECONST;
+
+    $owners_phid = id(new PhabricatorOwnersApplication())
+      ->getPHID();
+
+    return $object->getApplicationTransactionTemplate()
+      ->setAuthorPHID($owners_phid)
+      ->setTransactionType(PhabricatorTransactions::TYPE_EDGE)
+      ->setMetadataValue('edge:type', $edgetype_reviewer)
+      ->setNewValue(
+        array(
+          '+' => $value,
+        ));
   }
 
   protected function buildHeraldAdapter(
@@ -1518,6 +1727,10 @@ final class DifferentialTransactionEditor
     foreach ($changesets as $changeset) {
       $paths[] = $path_prefix.'/'.$changeset->getFilename();
     }
+
+    // Save the affected paths; we'll use them later to query Owners. This
+    // uses the un-expanded paths.
+    $this->affectedPaths = $paths;
 
     // Mark this as also touching all parent paths, so you can see all pending
     // changes to any file within a directory.
@@ -1659,20 +1872,14 @@ final class DifferentialTransactionEditor
       array('style' => 'font-family: monospace;'), $patch);
   }
 
-  private function renderPatchForMail(DifferentialDiff $diff) {
+  private function buildPatchForMail(DifferentialDiff $diff) {
     $format = PhabricatorEnv::getEnvConfig('metamta.differential.patch-format');
 
-    $patch = id(new DifferentialRawDiffRenderer())
+    return id(new DifferentialRawDiffRenderer())
       ->setViewer($this->getActor())
       ->setFormat($format)
       ->setChangesets($diff->getChangesets())
       ->buildPatch();
-
-    $section = new PhabricatorMetaMTAMailSection();
-    $section->addHTMLFragment($this->renderPatchHTMLForMail($patch));
-    $section->addPlaintextFragment($patch);
-
-    return $section;
   }
 
   protected function willPublish(PhabricatorLiskDAO $object, array $xactions) {

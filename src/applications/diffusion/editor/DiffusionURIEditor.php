@@ -3,6 +3,9 @@
 final class DiffusionURIEditor
   extends PhabricatorApplicationTransactionEditor {
 
+  private $repository;
+  private $repositoryPHID;
+
   public function getEditorApplicationClass() {
     return 'PhabricatorDiffusionApplication';
   }
@@ -74,6 +77,13 @@ final class DiffusionURIEditor
           $old_uri = $object->getEffectiveURI();
         } else {
           $old_uri = null;
+
+          // When creating a URI via the API, we may not have processed the
+          // repository transaction yet. Attach the repository here to make
+          // sure we have it for the calls below.
+          if ($this->repository) {
+            $object->attachRepository($this->repository);
+          }
         }
 
         $object->setURI($xaction->getNewValue());
@@ -115,6 +125,7 @@ final class DiffusionURIEditor
         break;
       case PhabricatorRepositoryURITransaction::TYPE_REPOSITORY:
         $object->setRepositoryPHID($xaction->getNewValue());
+        $object->attachRepository($this->repository);
         break;
       case PhabricatorRepositoryURITransaction::TYPE_CREDENTIAL:
         $object->setCredentialPHID($xaction->getNewValue());
@@ -151,6 +162,9 @@ final class DiffusionURIEditor
 
     switch ($type) {
       case PhabricatorRepositoryURITransaction::TYPE_REPOSITORY:
+        // Save this, since we need it to validate TYPE_IO transactions.
+        $this->repositoryPHID = $object->getRepositoryPHID();
+
         $missing = $this->validateIsEmptyTextField(
           $object->getRepositoryPHID(),
           $xactions);
@@ -208,6 +222,9 @@ final class DiffusionURIEditor
               $xaction);
             continue;
           }
+
+          $this->repository = $repository;
+          $this->repositoryPHID = $repository_phid;
         }
         break;
       case PhabricatorRepositoryURITransaction::TYPE_CREDENTIAL:
@@ -315,7 +332,7 @@ final class DiffusionURIEditor
           if ($no_observers || $no_readwrite) {
             $repository = id(new PhabricatorRepositoryQuery())
               ->setViewer(PhabricatorUser::getOmnipotentUser())
-              ->withPHIDs(array($object->getRepositoryPHID()))
+              ->withPHIDs(array($this->repositoryPHID))
               ->needURIs(true)
               ->executeOne();
             $uris = $repository->getURIs();
@@ -405,6 +422,26 @@ final class DiffusionURIEditor
           }
         }
         break;
+
+      case PhabricatorRepositoryURITransaction::TYPE_DISABLE:
+        $old = $object->getIsDisabled();
+        foreach ($xactions as $xaction) {
+          $new = $xaction->getNewValue();
+
+          if ($old == $new) {
+            continue;
+          }
+
+          if (!$object->isBuiltin()) {
+            continue;
+          }
+
+          $errors[] = new PhabricatorApplicationTransactionValidationError(
+            $type,
+            pht('Invalid'),
+            pht('You can not manually disable builtin URIs.'));
+        }
+        break;
     }
 
     return $errors;
@@ -433,6 +470,8 @@ final class DiffusionURIEditor
       break;
     }
 
+    $was_hosted = $repository->isHosted();
+
     if ($observe_uri) {
       $repository
         ->setHosted(false)
@@ -446,6 +485,17 @@ final class DiffusionURIEditor
     }
 
     $repository->save();
+
+    $is_hosted = $repository->isHosted();
+
+    // If we've swapped the repository from hosted to observed or vice versa,
+    // reset all the cluster version clocks.
+    if ($was_hosted != $is_hosted) {
+      $cluster_engine = id(new DiffusionRepositoryClusterEngine())
+        ->setViewer($this->getActor())
+        ->setRepository($repository)
+        ->synchronizeWorkingCopyAfterHostingChange();
+    }
 
     return $xactions;
   }
